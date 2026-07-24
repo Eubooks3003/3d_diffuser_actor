@@ -1,56 +1,63 @@
 # Remote training — mimicgen tokenization sweep (no rollouts)
 
-Training-only setup for the lambda remote. **No robotics/sim stack** and **no
-in-loop rollouts** (`--rollout_freq 0`) — the remote just trains and logs
-train/val loss. Rollout evaluation is done separately on a machine with a sim.
+Training-only setup. **No robotics/sim stack** and **no in-loop rollouts**
+(`--rollout_freq 0`) — the remote just trains and logs train/val loss. Rollout
+evaluation is done separately on a machine with a simulator.
 
-## 1. Clone the fork branch
-```bash
-git clone -b mimicgen-tokenization git@github.com:Eubooks3003/3d_diffuser_actor.git
-cd 3d_diffuser_actor
-```
+## Per-server setup (run on each server)
 
-## 2. Create the training env
+`/lambda/nfs` is shared across servers, so the repo + data are already visible
+everywhere — each server only needs its own local conda env.
+
 ```bash
-bash setup_remote_train_env.sh 3dda_train
+cd /path/to/3d_diffuser_actor          # shared checkout on NFS
+git pull                               # get the latest
+bash setup_remote_train_env.sh 3dda_train    # idempotent + self-verifying
 conda activate 3dda_train
-# sanity: model imports without the sim stack
-python -c "from diffuser_actor import DiffuserActor; print('import OK')"
 ```
-Installs (in order): torch 2.4.1+cu121 → flash-attn → `requirements_train.txt`.
-flash-attn needs an Ampere+ GPU (A100/H100 are fine).
+The script is arch-aware (x86_64 → cu121, aarch64/GH200 → cu124), upgrades pip
+first, and **skips flash-attn** (the attention layers fall back to torch SDPA,
+which runs FlashAttention-2 kernels on Hopper). It prints `import OK` when done.
+To also build flash-attn: `INSTALL_FLASH=1 bash setup_remote_train_env.sh`.
 
-## 3. Data
-Packed `.dat` (already blosc-compressed, RGB+depth+camera matrices per frame)
-live at:
+## Data
+Packed `.dat` (already blosc-compressed) at:
 ```
 /lambda/nfs/tal-lpwm-neurips-2026/data/mimicgen_3dda/<task>/{ep*.dat, meta.json, episode_lengths.json}
 ```
-One packing serves both absolute and relative policies. Single-task sweep needs
-only `stack_d0/` (~0.9 GB); multitask needs all 12 (~34 GB).
+One packing serves absolute and relative policies. `stack_d0/` alone (~0.9 GB)
+suffices for the single-task sweep.
 
-## 4. Run
-Point `--dataset` at the NFS copy and disable rollouts. Example (baseline):
+## Run — one experiment per server
+
+Each server trains one token config with `train_one_experiment.sh`:
 ```bash
-torchrun --nproc_per_node 1 --master_port 29600 main_trajectory_mimicgen.py \
-  --tasks stack_d0 \
-  --dataset /lambda/nfs/tal-lpwm-neurips-2026/data/mimicgen_3dda \
-  --batch_size 16 --batch_size_val 8 \
-  --train_iters 100000 --val_freq 2500 --val_iters 25 --num_workers 6 \
-  --rollout_freq 0 \
-  --action_token_groups '[3,6,1]' --proprio_token_groups '[3,6,1]' \
-  --run_log_dir stack_d0_baseline
+# experiment in: baseline single_action uniform random1 random2 no_proprio single_proprio
+bash scripts/train_one_experiment.sh <experiment> stack_d0 0 100000 \
+  /lambda/nfs/tal-lpwm-neurips-2026/data/mimicgen_3dda
 ```
+Suggested assignment (7 experiments, 4 servers — double up two servers):
 
-The 7 tokenization experiments are driven by
-`scripts/train_mimicgen_tokenization_sweep.sh` (see that file for the exact
-per-experiment `--action_token_groups` / `--proprio_token_groups`).
+| server | experiment(s) |
+|--------|---------------|
+| 1 | `baseline` |
+| 2 | `single_action` |
+| 3 | `uniform`, then `random1` |
+| 4 | `single_proprio`, then `random2`, then `no_proprio` |
+
+Logs → `train_logs/stack_d0_tok_<experiment>.log`; checkpoints →
+`train_logs/mimicgen/stack_d0_tok_<experiment>/{best,last}.pth`.
+
+All 7 on one server (sequential): `bash scripts/train_mimicgen_tokenization_sweep.sh`.
+
+The token groups (10-dim = pos(3)/rot6d(6)/gripper(1)) are defined once in
+`scripts/train_one_experiment.sh`.
 
 ## No-eval sanity signal
-Since rollouts are off, use `scripts/check_learning.py` to confirm the model is
-actually learning (beats repeat-current-pose / random-pose baselines) without a
-simulator.
+Rollouts are off, so confirm learning with `check_learning.py` (beats
+repeat-current-pose / random-pose baselines; no simulator):
 ```bash
-python scripts/check_learning.py --checkpoint train_logs/mimicgen/<run>/last.pth \
+python scripts/check_learning.py \
+  --checkpoint train_logs/mimicgen/stack_d0_tok_baseline/last.pth \
   --dataset /lambda/nfs/tal-lpwm-neurips-2026/data/mimicgen_3dda --task stack_d0
 ```
