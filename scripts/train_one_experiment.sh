@@ -19,13 +19,15 @@ ITERS=${4:-100000}
 DATASET=${5:-/lambda/nfs/tal-lpwm-neurips-2026/data/mimicgen_3dda}
 PORT=$((29600 + GPU))
 
-# Throughput knobs (env overrides) — keep these IDENTICAL across all 7 runs so
-# the tokenization comparison stays apples-to-apples. On a GH200, batch 16 badly
-# underuses the GPU; e.g. BATCH=64 WORKERS=16 LR=2e-4 with a smaller ITERS.
-BATCH=${BATCH:-16}
-VAL_BATCH=${VAL_BATCH:-8}
-WORKERS=${WORKERS:-6}
-LR=${LR:-1e-4}
+# Throughput knobs (env overrides) — defaults tuned for a GH200 (batch 16 badly
+# underuses it). Bigger batch => fewer steps for the same epochs, so the ITERS
+# default is 100k (NOT 300k): 300k steps at batch 64 trains ~4x too long.
+# LR is sqrt-scaled from 1e-4@16 -> 2e-4@64. Keep these IDENTICAL across all 7
+# runs so the tokenization comparison stays apples-to-apples.
+BATCH=${BATCH:-64}
+VAL_BATCH=${VAL_BATCH:-32}
+WORKERS=${WORKERS:-16}
+LR=${LR:-2e-4}
 
 ALL12="coffee_d0 coffee_preparation_d0 hammer_cleanup_d0 kitchen_d0 mug_cleanup_d0 nut_assembly_d0 pick_place_d0 square_d0 stack_d0 stack_three_d0 threading_d0 three_piece_assembly_d0"
 [ "$TASKS" = "all12" ] && TASKS="$ALL12"
