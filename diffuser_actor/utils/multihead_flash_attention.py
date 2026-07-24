@@ -12,7 +12,15 @@ from torch.nn.parameter import Parameter
 from torch.nn import Module
 from torch.nn import functional as F
 
-from flash_attn import flash_attn_func
+try:
+    from flash_attn import flash_attn_func
+    _HAS_FLASH = True
+except ImportError:
+    # No flash-attn wheel (e.g. aarch64 / GH200 where it must build from source).
+    # Fall back to torch SDPA, which dispatches to FlashAttention-2 kernels on
+    # Hopper anyway. See the call site for the layout handling.
+    flash_attn_func = None
+    _HAS_FLASH = False
 
 from .position_encodings import RotaryPositionEncoding
 from .multihead_custom_attention import MultiheadCustomAttention
@@ -400,9 +408,16 @@ def multi_head_attention_forward(query,  # type: Tensor
     q = q.unflatten(0, (bsz, num_heads)).transpose(1, 2).to(torch.float16)
     k = k.unflatten(0, (bsz, num_heads)).transpose(1, 2).to(torch.float16)
     v = v.unflatten(0, (bsz, num_heads)).transpose(1, 2).to(torch.float16)
-    attn_output = flash_attn_func(
-        q, k, v, dropout_p=dropout_p if training else 0.0
-    ).to(query.dtype) # (bs, tgt_len, nheads, dim)
+    if _HAS_FLASH:
+        attn_output = flash_attn_func(
+            q, k, v, dropout_p=dropout_p if training else 0.0
+        ).to(query.dtype)  # (bs, tgt_len, nheads, dim)
+    else:
+        # SDPA wants (bs, nheads, seqlen, dim); q/k/v are (bs, seqlen, nheads, dim)
+        attn_output = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            dropout_p=dropout_p if training else 0.0
+        ).transpose(1, 2).to(query.dtype)  # -> (bs, tgt_len, nheads, dim)
     attn_output = attn_output.flatten(-2) # (bs, tgt_len, nheads * dim)
 
     attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)

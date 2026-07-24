@@ -17,12 +17,20 @@ conda activate "$ENV"
 python -m pip install --upgrade pip
 echo "python=$(python --version 2>&1)  pip=$(pip --version)"
 
-# 1) torch FIRST, pinned (cu121 wheels — matches the local training stack)
-pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
+# 1) torch FIRST. aarch64 (GH200) CUDA wheels live on the cu124 index and only
+#    for newer versions, so don't hard-pin there; x86_64 matches the local stack.
+if [ "$(uname -m)" = "aarch64" ]; then
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+else
+  pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
+fi
 
-# 2) flash-attn (hard dependency of the attention layers; needs torch present).
-#    Ampere+ GPU required (A100/H100 on lambda are fine).
-pip install flash-attn --no-build-isolation
+# 2) flash-attn is OPTIONAL — the attention layers fall back to torch SDPA
+#    (which dispatches to FlashAttention-2 kernels on Ampere/Hopper anyway).
+#    On aarch64 / GH200 there is no prebuilt wheel and the source build is slow
+#    and fragile, so we attempt it best-effort and continue on failure.
+pip install flash-attn --no-build-isolation || \
+  echo "flash-attn not installed — using torch SDPA fallback (fine on GH200)."
 
 # 3) everything else (won't upgrade torch)
 pip install -r requirements_train.txt
