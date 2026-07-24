@@ -19,6 +19,14 @@ ITERS=${4:-100000}
 DATASET=${5:-/lambda/nfs/tal-lpwm-neurips-2026/data/mimicgen_3dda}
 PORT=$((29600 + GPU))
 
+# Throughput knobs (env overrides) — keep these IDENTICAL across all 7 runs so
+# the tokenization comparison stays apples-to-apples. On a GH200, batch 16 badly
+# underuses the GPU; e.g. BATCH=64 WORKERS=16 LR=2e-4 with a smaller ITERS.
+BATCH=${BATCH:-16}
+VAL_BATCH=${VAL_BATCH:-8}
+WORKERS=${WORKERS:-6}
+LR=${LR:-1e-4}
+
 ALL12="coffee_d0 coffee_preparation_d0 hammer_cleanup_d0 kitchen_d0 mug_cleanup_d0 nut_assembly_d0 pick_place_d0 square_d0 stack_d0 stack_three_d0 threading_d0 three_piece_assembly_d0"
 [ "$TASKS" = "all12" ] && TASKS="$ALL12"
 # run tag: the task name for single-task, "multitask" for >1 (task_id embedding
@@ -40,12 +48,12 @@ esac
 
 RUN="${TAG}_tok_${EXP}"
 mkdir -p train_logs
-echo "=== $RUN  (action=$ACT proprio=$PROP $EXTRA)  tasks=[$TASKS]  gpu=$GPU iters=$ITERS ==="
+echo "=== $RUN  (action=$ACT proprio=$PROP $EXTRA)  tasks=[$TASKS]  gpu=$GPU iters=$ITERS batch=$BATCH lr=$LR workers=$WORKERS ==="
 CUDA_VISIBLE_DEVICES=$GPU torchrun --nproc_per_node 1 --master_port $PORT \
   main_trajectory_mimicgen.py \
   --tasks $TASKS --dataset "$DATASET" \
-  --batch_size 16 --batch_size_val 8 \
-  --train_iters "$ITERS" --val_freq 2500 --val_iters 25 --num_workers 6 \
+  --batch_size "$BATCH" --batch_size_val "$VAL_BATCH" --lr "$LR" \
+  --train_iters "$ITERS" --val_freq 2500 --val_iters 25 --num_workers "$WORKERS" \
   --diffuse_gripper 1 \
   --action_token_groups "$ACT" --proprio_token_groups "$PROP" \
   $EXTRA \
