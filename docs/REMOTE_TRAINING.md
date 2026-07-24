@@ -30,12 +30,25 @@ suffices for the single-task sweep.
 
 ## Run — one experiment per server
 
-Each server trains one token config with `train_one_experiment.sh`:
+Each server trains one token config with `train_one_experiment.sh`. The 2nd arg
+is the task set: a single task, a quoted list, or `all12` for the **multitask**
+policy over all 12 tasks (task-ID embedding turns on automatically; token groups
+are identical). Multitask needs all 12 tasks packed on the NFS (~34 GB).
 ```bash
 # experiment in: baseline single_action uniform random1 random2 no_proprio single_proprio
+
+# single task:
 bash scripts/train_one_experiment.sh <experiment> stack_d0 0 100000 \
   /lambda/nfs/tal-lpwm-neurips-2026/data/mimicgen_3dda
+
+# multitask (all 12 tasks, one policy) — use a larger iter budget (see below):
+bash scripts/train_one_experiment.sh <experiment> all12 0 300000 \
+  /lambda/nfs/tal-lpwm-neurips-2026/data/mimicgen_3dda
 ```
+Iterations: single-task stack_d0 converges by ~20k (100k is ample). Multitask
+(12 tasks, ~10x the data, plus task disambiguation) is harder — use ~200-300k,
+watch val-loss for plateau/overfit, and compare on `best.pth`. Not 600k; that
+was RLBench-18 + language, heavier than mimicgen multitask.
 Suggested assignment (7 experiments, 4 servers — double up two servers):
 
 | server | experiment(s) |

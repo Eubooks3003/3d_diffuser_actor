@@ -12,11 +12,18 @@
 #          (server B): bash scripts/train_one_experiment.sh single_action
 set -e
 EXP=${1:?experiment required: baseline|single_action|uniform|random1|random2|no_proprio|single_proprio}
-TASK=${2:-stack_d0}
+# TASKS: a single task, a quoted space-separated list, or "all12" (multitask).
+TASKS=${2:-stack_d0}
 GPU=${3:-0}
 ITERS=${4:-100000}
 DATASET=${5:-/lambda/nfs/tal-lpwm-neurips-2026/data/mimicgen_3dda}
 PORT=$((29600 + GPU))
+
+ALL12="coffee_d0 coffee_preparation_d0 hammer_cleanup_d0 kitchen_d0 mug_cleanup_d0 nut_assembly_d0 pick_place_d0 square_d0 stack_d0 stack_three_d0 threading_d0 three_piece_assembly_d0"
+[ "$TASKS" = "all12" ] && TASKS="$ALL12"
+# run tag: the task name for single-task, "multitask" for >1 (task_id embedding
+# is enabled automatically; token groups are identical either way).
+if [ "$(echo $TASKS | wc -w)" -gt 1 ]; then TAG="multitask"; else TAG="$TASKS"; fi
 
 # groups sum to 10 = pos(3)+rot6d(6)+gripper(1). Random *proprio* groups match
 # EC-Diffuser's randgroupA/B (10-dim); random *action* groups are 10-dim analogues.
@@ -31,12 +38,12 @@ case "$EXP" in
   *) echo "unknown experiment: $EXP"; exit 1 ;;
 esac
 
-RUN="${TASK}_tok_${EXP}"
+RUN="${TAG}_tok_${EXP}"
 mkdir -p train_logs
-echo "=== $RUN  (action=$ACT proprio=$PROP $EXTRA)  gpu=$GPU iters=$ITERS ==="
+echo "=== $RUN  (action=$ACT proprio=$PROP $EXTRA)  tasks=[$TASKS]  gpu=$GPU iters=$ITERS ==="
 CUDA_VISIBLE_DEVICES=$GPU torchrun --nproc_per_node 1 --master_port $PORT \
   main_trajectory_mimicgen.py \
-  --tasks "$TASK" --dataset "$DATASET" \
+  --tasks $TASKS --dataset "$DATASET" \
   --batch_size 16 --batch_size_val 8 \
   --train_iters "$ITERS" --val_freq 2500 --val_iters 25 --num_workers 6 \
   --diffuse_gripper 1 \
