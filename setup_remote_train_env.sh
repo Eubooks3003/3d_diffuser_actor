@@ -11,6 +11,12 @@ conda create -y -n "$ENV" python=3.10
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$ENV"
 
+# 0) a fresh pip — old pip cannot read torch 2.x wheel tags (manylinux_2_28) and
+#    fails with "No matching distribution found for torch==2.4.1", only seeing
+#    versions up to 2.0.1. This is the usual cause of that error.
+python -m pip install --upgrade pip
+echo "python=$(python --version 2>&1)  pip=$(pip --version)"
+
 # 1) torch FIRST, pinned (cu121 wheels — matches the local training stack)
 pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
 
