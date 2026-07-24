@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,6 +25,30 @@ from diffuser_actor.utils.utils import (
 )
 
 
+def resolve_token_groups(spec, dim):
+    """Normalize a token-group spec into a list of group sizes summing to `dim`.
+
+    Mirrors the semantics of EC-Diffuser's `pint.py`:
+      'default' / None -> None, i.e. keep the single-token baseline path
+      'per_dim'        -> [1] * dim   (EC-Diffuser's "uniform action")
+      [3, 6], [2,1,...]-> used as-is, must sum to dim
+    """
+    if spec is None or spec == 'default':
+        return None
+    if spec == 'per_dim':
+        return [1] * dim
+    if isinstance(spec, str):
+        spec = [int(x) for x in spec.replace(' ', '').strip('[]').split(',') if x]
+    groups = [int(g) for g in spec]
+    if sum(groups) != dim:
+        raise ValueError(
+            f"token groups {groups} sum to {sum(groups)}, expected {dim}"
+        )
+    if any(g <= 0 for g in groups):
+        raise ValueError(f"token groups must be positive, got {groups}")
+    return groups
+
+
 class DiffuserActor(nn.Module):
 
     def __init__(self,
@@ -39,11 +64,16 @@ class DiffuserActor(nn.Module):
                  diffusion_timesteps=100,
                  nhist=3,
                  relative=False,
-                 lang_enhanced=False):
+                 lang_enhanced=False,
+                 action_token_groups='default',
+                 proprio_token_groups='default',
+                 no_proprio=False,
+                 n_tasks=1):
         super().__init__()
         self._rotation_parametrization = rotation_parametrization
         self._quaternion_format = quaternion_format
         self._relative = relative
+        self.no_proprio = no_proprio
         self.use_instruction = use_instruction
         self.encoder = Encoder(
             backbone=backbone,
@@ -59,7 +89,10 @@ class DiffuserActor(nn.Module):
             use_instruction=use_instruction,
             rotation_parametrization=rotation_parametrization,
             nhist=nhist,
-            lang_enhanced=lang_enhanced
+            lang_enhanced=lang_enhanced,
+            action_token_groups=action_token_groups,
+            proprio_token_groups=proprio_token_groups,
+            n_tasks=n_tasks
         )
         self.position_noise_scheduler = DDPMScheduler(
             num_train_timesteps=diffusion_timesteps,
@@ -75,7 +108,7 @@ class DiffuserActor(nn.Module):
         self.gripper_loc_bounds = torch.tensor(gripper_loc_bounds)
 
     def encode_inputs(self, visible_rgb, visible_pcd, instruction,
-                      curr_gripper):
+                      curr_gripper, task_id=None):
         # Compute visual features/positional embeddings at different scales
         rgb_feats_pyramid, pcd_pyramid = self.encoder.encode_images(
             visible_rgb, visible_pcd
@@ -113,7 +146,9 @@ class DiffuserActor(nn.Module):
             context_feats, context,  # contextualized visual features
             instr_feats,  # language features
             adaln_gripper_feats,  # gripper history features
-            fps_feats, fps_pos  # sampled visual features
+            fps_feats, fps_pos,  # sampled visual features
+            curr_gripper,  # raw proprio dims, for proprio token grouping
+            task_id  # multitask conditioning
         )
 
     def policy_forward_pass(self, trajectory, timestep, fixed_inputs):
@@ -124,7 +159,9 @@ class DiffuserActor(nn.Module):
             instr_feats,
             adaln_gripper_feats,
             fps_feats,
-            fps_pos
+            fps_pos,
+            curr_gripper_raw,
+            task_id
         ) = fixed_inputs
 
         return self.prediction_head(
@@ -135,7 +172,9 @@ class DiffuserActor(nn.Module):
             instr_feats=instr_feats,
             adaln_gripper_feats=adaln_gripper_feats,
             fps_feats=fps_feats,
-            fps_pos=fps_pos
+            fps_pos=fps_pos,
+            curr_gripper_raw=curr_gripper_raw,
+            task_id=task_id
         )
 
     def conditional_sample(self, condition_data, condition_mask, fixed_inputs):
@@ -190,7 +229,8 @@ class DiffuserActor(nn.Module):
         rgb_obs,
         pcd_obs,
         instruction,
-        curr_gripper
+        curr_gripper,
+        task_id=None
     ):
         # Normalize all pos
         pcd_obs = pcd_obs.clone()
@@ -203,7 +243,7 @@ class DiffuserActor(nn.Module):
 
         # Prepare inputs
         fixed_inputs = self.encode_inputs(
-            rgb_obs, pcd_obs, instruction, curr_gripper
+            rgb_obs, pcd_obs, instruction, curr_gripper, task_id
         )
 
         # Condition on start-end pose
@@ -303,7 +343,8 @@ class DiffuserActor(nn.Module):
         pcd_obs,
         instruction,
         curr_gripper,
-        run_inference=False
+        run_inference=False,
+        task_id=None
     ):
         """
         Arguments:
@@ -326,6 +367,14 @@ class DiffuserActor(nn.Module):
             gt_openess = gt_trajectory[..., 7:]
             gt_trajectory = gt_trajectory[..., :7]
         curr_gripper = curr_gripper[..., :7]
+        if self.no_proprio:
+            # Ablation (EC-Diffuser "no proprio"): strip all proprioceptive
+            # information by replacing the gripper history with a constant
+            # canonical pose, so the adaln/timestep gripper conditioning carries
+            # no per-sample signal. Pairs with absolute actions -- relative mode
+            # would leak the current pose back in through convert2rel.
+            curr_gripper = torch.zeros_like(curr_gripper)
+            curr_gripper[..., 3] = 1.0  # identity quaternion (wxyz)
 
         # gt_trajectory is expected to be in the quaternion format
         if run_inference:
@@ -334,7 +383,8 @@ class DiffuserActor(nn.Module):
                 rgb_obs,
                 pcd_obs,
                 instruction,
-                curr_gripper
+                curr_gripper,
+                task_id
             )
         # Normalize all pos
         gt_trajectory = gt_trajectory.clone()
@@ -352,7 +402,7 @@ class DiffuserActor(nn.Module):
 
         # Prepare inputs
         fixed_inputs = self.encode_inputs(
-            rgb_obs, pcd_obs, instruction, curr_gripper
+            rgb_obs, pcd_obs, instruction, curr_gripper, task_id
         )
 
         # Condition on start-end pose
@@ -412,7 +462,10 @@ class DiffusionHead(nn.Module):
                  use_instruction=False,
                  rotation_parametrization='quat',
                  nhist=3,
-                 lang_enhanced=False):
+                 lang_enhanced=False,
+                 action_token_groups='default',
+                 proprio_token_groups='default',
+                 n_tasks=1):
         super().__init__()
         self.use_instruction = use_instruction
         self.lang_enhanced = lang_enhanced
@@ -421,8 +474,36 @@ class DiffusionHead(nn.Module):
         else:
             rotation_dim = 4  # quaternion
 
-        # Encoders
-        self.traj_encoder = nn.Linear(9, embedding_dim)
+        # --- Action tokenization -------------------------------------------
+        # The diffused action vector is [pos(3), rot(rotation_dim)]; openness is
+        # predicted from position features rather than diffused, so grouping
+        # partitions these dims only.
+        #
+        # 'default' keeps the original single-token-per-timestep encoder so the
+        # vanilla baseline is bit-for-bit the upstream architecture.
+        self.action_dim = 3 + rotation_dim
+        self.action_token_groups = resolve_token_groups(
+            action_token_groups, self.action_dim
+        )
+        if self.action_token_groups is None:
+            self.traj_encoder = nn.Linear(self.action_dim, embedding_dim)
+        else:
+            groups = self.action_token_groups
+            self.group_offsets = np.cumsum([0] + list(groups)).tolist()
+            self.traj_group_encoders = nn.ModuleList([
+                nn.Linear(g, embedding_dim) for g in groups
+            ])
+            # lets the model tell otherwise-identical sub-tokens apart
+            self.group_embed = nn.Embedding(len(groups), embedding_dim)
+            # Each group reads BOTH branches, so 3DDA's position/rotation
+            # specialization survives groups that straddle the pos/rot boundary.
+            self.group_predictors = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(2 * embedding_dim, embedding_dim),
+                    nn.ReLU(),
+                    nn.Linear(embedding_dim, g)
+                ) for g in groups
+            ])
         self.relative_pe_layer = RotaryPositionEncoding3D(embedding_dim)
         self.time_emb = nn.Sequential(
             SinusoidalPosEmb(embedding_dim),
@@ -435,6 +516,36 @@ class DiffusionHead(nn.Module):
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim)
         )
+
+        # --- Proprio tokenization ------------------------------------------
+        # EC-Diffuser splits proprio into sub-tokens that feed the AdaLN
+        # conditioning; the analogue here is to encode dim-groups of the raw
+        # gripper history separately before they reach the timestep embedding.
+        self.proprio_token_groups = resolve_token_groups(
+            proprio_token_groups, self.action_dim
+        )
+        if self.proprio_token_groups is not None:
+            pg = self.proprio_token_groups
+            self.proprio_offsets = np.cumsum([0] + list(pg)).tolist()
+            self.proprio_group_encoders = nn.ModuleList([
+                nn.Linear(g, embedding_dim) for g in pg
+            ])
+            self.proprio_group_embed = nn.Embedding(len(pg), embedding_dim)
+            self.proprio_emb = nn.Sequential(
+                nn.Linear(embedding_dim * nhist * len(pg), embedding_dim),
+                nn.ReLU(),
+                nn.Linear(embedding_dim, embedding_dim)
+            )
+
+        # Multitask conditioning: a learned task-ID embedding added to the
+        # diffusion timestep embedding, mirroring EC-Diffuser's pint.py. No
+        # language is used. A no-op when n_tasks <= 1.
+        self.n_tasks = int(n_tasks)
+        if self.n_tasks > 1:
+            self.task_embedding = nn.Embedding(self.n_tasks, embedding_dim)
+            nn.init.normal_(self.task_embedding.weight, std=0.02)
+        else:
+            self.task_embedding = None
         self.traj_time_emb = SinusoidalPosEmb(embedding_dim)
 
         # Attention from trajectory queries to language
@@ -508,7 +619,7 @@ class DiffusionHead(nn.Module):
 
     def forward(self, trajectory, timestep,
                 context_feats, context, instr_feats, adaln_gripper_feats,
-                fps_feats, fps_pos):
+                fps_feats, fps_pos, curr_gripper_raw=None, task_id=None):
         """
         Arguments:
             trajectory: (B, trajectory_length, 3+6+X)
@@ -521,12 +632,32 @@ class DiffusionHead(nn.Module):
             fps_pos: (B, N, F, 2)
         """
         # Trajectory features
-        traj_feats = self.traj_encoder(trajectory)  # (B, L, F)
+        n_groups = 1
+        if self.action_token_groups is None:
+            traj_feats = self.traj_encoder(trajectory)  # (B, L, F)
+            traj_steps = traj_feats.size(1)
+        else:
+            # One sub-token per group per timestep, laid out as
+            # [t0g0, t0g1, ..., t0gG, t1g0, ...] so a timestep's sub-tokens stay
+            # contiguous and reshape(L, G) recovers the grouping.
+            n_groups = len(self.action_token_groups)
+            traj_steps = trajectory.size(1)
+            per_group = [
+                enc(trajectory[..., self.group_offsets[i]:self.group_offsets[i + 1]])
+                for i, enc in enumerate(self.traj_group_encoders)
+            ]
+            traj_feats = torch.stack(per_group, dim=2)  # (B, L, G, F)
+            gid = torch.arange(n_groups, device=trajectory.device)
+            traj_feats = traj_feats + self.group_embed(gid)[None, None]
+            traj_feats = traj_feats.flatten(1, 2)  # (B, L*G, F)
 
         # Trajectory features cross-attend to context features
         traj_time_pos = self.traj_time_emb(
-            torch.arange(0, traj_feats.size(1), device=traj_feats.device)
+            torch.arange(0, traj_steps, device=traj_feats.device)
         )[None].repeat(len(traj_feats), 1, 1)
+        if n_groups > 1:
+            # every sub-token of a timestep shares that timestep's time code
+            traj_time_pos = traj_time_pos.repeat_interleave(n_groups, dim=1)
         if self.use_instruction:
             traj_feats, _ = self.traj_lang_attention[0](
                 seq1=traj_feats, seq1_key_padding_mask=None,
@@ -542,12 +673,21 @@ class DiffusionHead(nn.Module):
         adaln_gripper_feats = einops.rearrange(
             adaln_gripper_feats, 'b l c -> l b c'
         )
+        # 3D positions for the rotary PE: sub-tokens of a timestep sit at that
+        # timestep's position.
+        traj_xyz = trajectory[..., :3]
+        if n_groups > 1:
+            traj_xyz = traj_xyz.repeat_interleave(n_groups, dim=1)
+
         pos_pred, rot_pred, openess_pred = self.prediction_head(
-            trajectory[..., :3], traj_feats,
+            traj_xyz, traj_feats,
             context[..., :3], context_feats,
             timestep, adaln_gripper_feats,
             fps_feats, fps_pos,
-            instr_feats
+            instr_feats,
+            n_groups=n_groups,
+            curr_gripper_raw=curr_gripper_raw,
+            task_id=task_id
         )
         return [torch.cat((pos_pred, rot_pred, openess_pred), -1)]
 
@@ -556,7 +696,8 @@ class DiffusionHead(nn.Module):
                         context_pcd, context_features,
                         timesteps, curr_gripper_features,
                         sampled_context_features, sampled_rel_context_pos,
-                        instr_feats):
+                        instr_feats, n_groups=1, curr_gripper_raw=None,
+                        task_id=None):
         """
         Compute the predicted action (position, rotation, opening).
 
@@ -573,7 +714,7 @@ class DiffusionHead(nn.Module):
         """
         # Diffusion timestep
         time_embs = self.encode_denoising_timestep(
-            timesteps, curr_gripper_features
+            timesteps, curr_gripper_features, curr_gripper_raw, task_id
         )
 
         # Positional embeddings
@@ -603,7 +744,7 @@ class DiffusionHead(nn.Module):
         num_gripper = gripper_features.shape[0]
 
         # Rotation head
-        rotation = self.predict_rot(
+        rotation, rotation_features = self.predict_rot(
             features, rel_pos, time_embs, num_gripper, instr_feats
         )
 
@@ -612,17 +753,37 @@ class DiffusionHead(nn.Module):
             features, rel_pos, time_embs, num_gripper, instr_feats
         )
 
+        if n_groups > 1:
+            # Re-derive the action from per-group heads instead of the two
+            # baseline predictors. Each group reads both branches so grouping
+            # across the pos/rot boundary is well defined.
+            joint = torch.cat([position_features, rotation_features], dim=-1)
+            bs, ntok, _ = joint.shape
+            joint = joint.view(bs, ntok // n_groups, n_groups, -1)
+            action = torch.cat(
+                [head(joint[:, :, i]) for i, head in enumerate(self.group_predictors)],
+                dim=-1
+            )  # (B, L, action_dim), groups concatenated back in dim order
+            position, rotation = action[..., :3], action[..., 3:]
+            # openness comes from the timestep's pooled position features
+            position_features = position_features.view(
+                bs, ntok // n_groups, n_groups, -1
+            ).mean(2)
+
         # Openess head from position head
         openess = self.openess_predictor(position_features)
 
         return position, rotation, openess
 
-    def encode_denoising_timestep(self, timestep, curr_gripper_features):
+    def encode_denoising_timestep(self, timestep, curr_gripper_features,
+                                  curr_gripper_raw=None, task_id=None):
         """
         Compute denoising timestep features and positional embeddings.
 
         Args:
             - timestep: (B,)
+            - curr_gripper_raw: (B, nhist, action_dim), for proprio grouping
+            - task_id: (B,) long, for multitask conditioning
 
         Returns:
             - time_feats: (B, F)
@@ -634,7 +795,23 @@ class DiffusionHead(nn.Module):
         )
         curr_gripper_features = curr_gripper_features.flatten(1)
         curr_gripper_feats = self.curr_gripper_emb(curr_gripper_features)
-        return time_feats + curr_gripper_feats
+        out = time_feats + curr_gripper_feats
+
+        if self.proprio_token_groups is not None and curr_gripper_raw is not None:
+            per_group = [
+                enc(curr_gripper_raw[..., self.proprio_offsets[i]:self.proprio_offsets[i + 1]])
+                for i, enc in enumerate(self.proprio_group_encoders)
+            ]
+            feats = torch.stack(per_group, dim=2)  # (B, nhist, G, F)
+            gid = torch.arange(feats.size(2), device=feats.device)
+            feats = feats + self.proprio_group_embed(gid)[None, None]
+            out = out + self.proprio_emb(feats.flatten(1))
+
+        if self.task_embedding is not None and task_id is not None:
+            task_id = task_id.to(dtype=torch.long, device=out.device).view(-1)
+            out = out + self.task_embedding(task_id)
+
+        return out
 
     def predict_pos(self, features, rel_pos, time_embs, num_gripper,
                     instr_feats):
@@ -666,4 +843,4 @@ class DiffusionHead(nn.Module):
         )
         rotation_features = self.rotation_proj(rotation_features)  # (B, N, C)
         rotation = self.rotation_predictor(rotation_features)
-        return rotation
+        return rotation, rotation_features

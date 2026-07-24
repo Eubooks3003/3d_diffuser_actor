@@ -1,4 +1,3 @@
-import dgl.geometry as dgl_geo
 import einops
 import torch
 from torch import nn
@@ -9,6 +8,36 @@ from .position_encodings import RotaryPositionEncoding3D
 from .layers import FFWRelativeCrossAttentionModule, ParallelAttention
 from .resnet import load_resnet50, load_resnet18
 from .clip import load_clip
+
+
+def farthest_point_sampler(pos, npoints, start_idx=0):
+    """Drop-in replacement for dgl.geometry.farthest_point_sampler.
+
+    DGL no longer serves wheels compatible with torch>=2.0, and this was the
+    only use of dgl in the codebase.
+
+    Args:
+        pos: (B, N, C) point coordinates/features
+        npoints: number of points to sample
+        start_idx: index of the first sampled point (DGL default is a random
+            index; the call site passes 0 explicitly)
+    Returns:
+        (B, npoints) long tensor of sampled indices
+    """
+    bs, npts, _ = pos.shape
+    device = pos.device
+    centroids = torch.zeros(bs, npoints, dtype=torch.long, device=device)
+    distance = torch.full((bs, npts), float("inf"), dtype=pos.dtype, device=device)
+    farthest = torch.full((bs,), start_idx, dtype=torch.long, device=device)
+    batch_inds = torch.arange(bs, dtype=torch.long, device=device)
+
+    for i in range(npoints):
+        centroids[:, i] = farthest
+        centroid = pos[batch_inds, farthest].unsqueeze(1)  # (B, 1, C)
+        distance = torch.minimum(distance, ((pos - centroid) ** 2).sum(-1))
+        farthest = distance.max(-1)[1]
+
+    return centroids
 
 
 class Encoder(nn.Module):
@@ -50,7 +79,10 @@ class Encoder(nn.Module):
             # at 1/4 resolution (32x32)
             # Fine RGB features are the 1st layer of the feature pyramid
             # at 1/2 resolution (64x64)
-            self.coarse_feature_map = ['res2', 'res1', 'res1', 'res1']
+            # Upstream named this `coarse_feature_map`, but `encode_images`
+            # reads `feature_map_pyramid` (as set on the 256x256 branch below),
+            # so image_size=(128, 128) raised AttributeError upstream.
+            self.feature_map_pyramid = ['res2', 'res1', 'res1', 'res1']
             self.downscaling_factor_pyramid = [4, 2, 2, 2]
         elif self.image_size == (256, 256):
             # Coarse RGB features are the 3rd layer of the feature pyramid
@@ -242,7 +274,7 @@ class Encoder(nn.Module):
         npts, bs, ch = context_features.shape
 
         # Sample points with FPS
-        sampled_inds = dgl_geo.farthest_point_sampler(
+        sampled_inds = farthest_point_sampler(
             einops.rearrange(
                 context_features,
                 "npts b c -> b npts c"
