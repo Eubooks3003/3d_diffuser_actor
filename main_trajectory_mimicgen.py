@@ -70,6 +70,7 @@ class Arguments(tap.Tap):
     action_token_groups: str = "default"
     proprio_token_groups: str = "default"
     no_proprio: int = 0  # EC-Diffuser "no proprio" ablation; requires absolute actions
+    diffuse_gripper: int = 0  # Option B: diffuse openness (action_dim 9->10) for a gripper token
 
     # In-training rollout eval: actually runs the policy in the simulator and
     # reports task success, which loss/pos_err cannot tell you.
@@ -244,6 +245,7 @@ class TrainTester(BaseTrainTester):
                 else parse_groups(self.args.proprio_token_groups)
             ),
             no_proprio=bool(self.args.no_proprio),
+            diffuse_gripper=bool(self.args.diffuse_gripper),
             n_tasks=len(self.args.tasks),
         )
         print("Model parameters:", count_parameters(_model))

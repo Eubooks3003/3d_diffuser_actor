@@ -68,12 +68,17 @@ class DiffuserActor(nn.Module):
                  action_token_groups='default',
                  proprio_token_groups='default',
                  no_proprio=False,
+                 diffuse_gripper=False,
                  n_tasks=1):
         super().__init__()
         self._rotation_parametrization = rotation_parametrization
         self._quaternion_format = quaternion_format
         self._relative = relative
         self.no_proprio = no_proprio
+        # Option B: fold gripper openness into the diffused action (action_dim
+        # 9 -> 10) so it becomes a real token, instead of a separate head. Lets
+        # [3,6,1] semantic tokenization include a gripper token.
+        self.diffuse_gripper = diffuse_gripper
         self.use_instruction = use_instruction
         self.encoder = Encoder(
             backbone=backbone,
@@ -92,6 +97,7 @@ class DiffuserActor(nn.Module):
             lang_enhanced=lang_enhanced,
             action_token_groups=action_token_groups,
             proprio_token_groups=proprio_token_groups,
+            diffuse_gripper=diffuse_gripper,
             n_tasks=n_tasks
         )
         self.position_noise_scheduler = DDPMScheduler(
@@ -197,7 +203,12 @@ class DiffuserActor(nn.Module):
         noise_rot = self.rotation_noise_scheduler.add_noise(
             condition_data[..., 3:9], noise[..., 3:9], noise_t
         )
-        noisy_condition_data = torch.cat((noise_pos, noise_rot), -1)
+        cond_parts = [noise_pos, noise_rot]
+        if self.diffuse_gripper:
+            cond_parts.append(self.position_noise_scheduler.add_noise(
+                condition_data[..., 9:10], noise[..., 9:10], noise_t
+            ))
+        noisy_condition_data = torch.cat(cond_parts, -1)
         trajectory = torch.where(
             condition_mask, noisy_condition_data, noise
         )
@@ -217,9 +228,16 @@ class DiffuserActor(nn.Module):
             rot = self.rotation_noise_scheduler.step(
                 out[..., 3:9], t, trajectory[..., 3:9]
             ).prev_sample
-            trajectory = torch.cat((pos, rot), -1)
+            step_parts = [pos, rot]
+            if self.diffuse_gripper:
+                step_parts.append(self.position_noise_scheduler.step(
+                    out[..., 9:10], t, trajectory[..., 9:10]
+                ).prev_sample)
+            trajectory = torch.cat(step_parts, -1)
 
-        trajectory = torch.cat((trajectory, out[..., 9:]), -1)
+        if not self.diffuse_gripper:
+            # Option A: append the head-predicted openness (not diffused).
+            trajectory = torch.cat((trajectory, out[..., 9:]), -1)
 
         return trajectory
 
@@ -271,7 +289,11 @@ class DiffuserActor(nn.Module):
         trajectory[:, :, :3] = self.unnormalize_pos(trajectory[:, :, :3])
         # Convert gripper status to probaility
         if trajectory.shape[-1] > 7:
-            trajectory[..., 7] = trajectory[..., 7].sigmoid()
+            if self.diffuse_gripper:
+                # Diffused openness lives in [-1,1]; map back to [0,1].
+                trajectory[..., 7] = ((trajectory[..., 7] + 1) / 2).clamp(0, 1)
+            else:
+                trajectory[..., 7] = trajectory[..., 7].sigmoid()
 
         return trajectory
 
@@ -365,8 +387,24 @@ class DiffuserActor(nn.Module):
             pcd_obs, curr_gripper = self.convert2rel(pcd_obs, curr_gripper)
         if gt_trajectory is not None:
             gt_openess = gt_trajectory[..., 7:]
-            gt_trajectory = gt_trajectory[..., :7]
-        curr_gripper = curr_gripper[..., :7]
+            if self.diffuse_gripper:
+                # Keep openness in the diffused trajectory; map {0,1}->{-1,1} to
+                # match the [-1,1] range the diffusion operates in.
+                gt_trajectory = torch.cat(
+                    [gt_trajectory[..., :7], gt_openess * 2 - 1], dim=-1
+                )
+            else:
+                gt_trajectory = gt_trajectory[..., :7]
+        if self.diffuse_gripper:
+            # Proprio keeps openness too, so a dedicated proprio gripper group
+            # (e.g. the '1' in [3,6,1]) is well-defined.
+            cg_open = (curr_gripper[..., 7:8] if curr_gripper.size(-1) > 7
+                       else torch.ones_like(curr_gripper[..., :1]))
+            curr_gripper = torch.cat(
+                [curr_gripper[..., :7], cg_open * 2 - 1], dim=-1
+            )
+        else:
+            curr_gripper = curr_gripper[..., :7]
         if self.no_proprio:
             # Ablation (EC-Diffuser "no proprio"): strip all proprioceptive
             # information by replacing the gripper history with a constant
@@ -429,7 +467,13 @@ class DiffuserActor(nn.Module):
             gt_trajectory[..., 3:9], noise[..., 3:9],
             timesteps
         )
-        noisy_trajectory = torch.cat((pos, rot), -1)
+        noisy_parts = [pos, rot]
+        if self.diffuse_gripper:
+            grip = self.position_noise_scheduler.add_noise(
+                gt_trajectory[..., 9:10], noise[..., 9:10], timesteps
+            )
+            noisy_parts.append(grip)
+        noisy_trajectory = torch.cat(noisy_parts, -1)
         noisy_trajectory[cond_mask] = cond_data[cond_mask]  # condition
         assert not cond_mask.any()
 
@@ -447,7 +491,13 @@ class DiffuserActor(nn.Module):
                 30 * F.l1_loss(trans, noise[..., :3], reduction='mean')
                 + 10 * F.l1_loss(rot, noise[..., 3:9], reduction='mean')
             )
-            if torch.numel(gt_openess) > 0:
+            if self.diffuse_gripper:
+                # Openness is diffused like position: supervise its noise
+                # residual with L1 (no separate BCE head).
+                loss = loss + 10 * F.l1_loss(
+                    layer_pred[..., 9:10], noise[..., 9:10], reduction='mean'
+                )
+            elif torch.numel(gt_openess) > 0:
                 openess = layer_pred[..., 9:]
                 loss += F.binary_cross_entropy_with_logits(openess, gt_openess)
             total_loss = total_loss + loss
@@ -465,6 +515,7 @@ class DiffusionHead(nn.Module):
                  lang_enhanced=False,
                  action_token_groups='default',
                  proprio_token_groups='default',
+                 diffuse_gripper=False,
                  n_tasks=1):
         super().__init__()
         self.use_instruction = use_instruction
@@ -475,16 +526,24 @@ class DiffusionHead(nn.Module):
             rotation_dim = 4  # quaternion
 
         # --- Action tokenization -------------------------------------------
-        # The diffused action vector is [pos(3), rot(rotation_dim)]; openness is
-        # predicted from position features rather than diffused, so grouping
-        # partitions these dims only.
+        # Baseline: the diffused action vector is [pos(3), rot(rotation_dim)];
+        # openness is predicted from position features rather than diffused, so
+        # grouping partitions these dims only (Option A).
+        # Option B (diffuse_gripper): openness becomes the diffused (action_dim)
+        # th dim so [3,6,1]-style grouping can give it a dedicated token.
         #
         # 'default' keeps the original single-token-per-timestep encoder so the
         # vanilla baseline is bit-for-bit the upstream architecture.
-        self.action_dim = 3 + rotation_dim
+        self.diffuse_gripper = diffuse_gripper
+        self.action_dim = 3 + rotation_dim + (1 if diffuse_gripper else 0)
         self.action_token_groups = resolve_token_groups(
             action_token_groups, self.action_dim
         )
+        if self.action_token_groups is None and self.diffuse_gripper:
+            # The baseline single-token path emits pos+rot only; a diffused
+            # gripper needs the per-group predictors, so cover the whole action
+            # with one group.
+            self.action_token_groups = [self.action_dim]
         if self.action_token_groups is None:
             self.traj_encoder = nn.Linear(self.action_dim, embedding_dim)
         else:
@@ -753,10 +812,12 @@ class DiffusionHead(nn.Module):
             features, rel_pos, time_embs, num_gripper, instr_feats
         )
 
-        if n_groups > 1:
+        grip = None
+        if n_groups > 1 or self.diffuse_gripper:
             # Re-derive the action from per-group heads instead of the two
             # baseline predictors. Each group reads both branches so grouping
-            # across the pos/rot boundary is well defined.
+            # across the pos/rot boundary is well defined. diffuse_gripper forces
+            # this path so the (grouped) gripper dim is predicted here too.
             joint = torch.cat([position_features, rotation_features], dim=-1)
             bs, ntok, _ = joint.shape
             joint = joint.view(bs, ntok // n_groups, n_groups, -1)
@@ -764,14 +825,23 @@ class DiffusionHead(nn.Module):
                 [head(joint[:, :, i]) for i, head in enumerate(self.group_predictors)],
                 dim=-1
             )  # (B, L, action_dim), groups concatenated back in dim order
-            position, rotation = action[..., :3], action[..., 3:]
+            if self.diffuse_gripper:
+                position = action[..., :3]
+                rotation = action[..., 3:9]
+                grip = action[..., 9:10]
+            else:
+                position, rotation = action[..., :3], action[..., 3:]
             # openness comes from the timestep's pooled position features
             position_features = position_features.view(
                 bs, ntok // n_groups, n_groups, -1
             ).mean(2)
 
-        # Openess head from position head
-        openess = self.openess_predictor(position_features)
+        if self.diffuse_gripper:
+            # Option B: openness is the diffused gripper dim, not a head.
+            openess = grip
+        else:
+            # Option A: openness head from position head.
+            openess = self.openess_predictor(position_features)
 
         return position, rotation, openess
 
