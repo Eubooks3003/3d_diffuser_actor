@@ -40,7 +40,7 @@ def main():
     p.add_argument("--tasks", default=",".join(ALL12))
     p.add_argument("--seeds", default="42,123,456")
     p.add_argument("--n_rollouts", type=int, default=50)
-    p.add_argument("--max_steps", type=int, default=400)
+    p.add_argument("--max_steps", type=int, default=0)  # 0 = per-task auto (2x median demo)
     p.add_argument("--gpus", default="0")
     p.add_argument("--concurrency", type=int, default=0)  # 0 -> one per gpu
     p.add_argument("--output_dir", default="eval_results")

@@ -81,7 +81,10 @@ def main():
     p.add_argument("--task", required=True, choices=ALL12)
     p.add_argument("--seeds", default="42,123,456")
     p.add_argument("--n_rollouts", type=int, default=50)
-    p.add_argument("--max_steps", type=int, default=400)
+    p.add_argument("--max_steps", type=int, default=0,
+                   help="0 = auto: 2x the task's median demo length. A fixed "
+                        "400 silently made long tasks (coffee_preparation ~705, "
+                        "pick_place ~673, kitchen ~624 steps) impossible.")
     p.add_argument("--output_dir", required=True,
                    help="task-level dir: result.json + seed_*/ video folders")
     p.add_argument("--packed_root", default=DEFAULT_PACKED)
@@ -98,6 +101,13 @@ def main():
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
     if args.save_videos:
         import imageio
+
+    if args.max_steps <= 0:
+        with open(Path(DEFAULT_PKL_ROOT) / args.task / f"{args.task}.pkl", "rb") as f:
+            plens = pickle.load(f)["path_lengths"][:200]
+        args.max_steps = int(2 * np.median(plens))
+        print(f"[{args.experiment}/{args.task}] auto max_steps={args.max_steps} "
+              f"(2x median demo len {int(np.median(plens))})", flush=True)
 
     bounds = union_bounds(args.packed_root, ALL12)
     model = build_model(args.experiment, args.checkpoint, bounds, args.device)
