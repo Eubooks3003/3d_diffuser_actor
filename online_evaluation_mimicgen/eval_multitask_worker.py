@@ -1,14 +1,21 @@
-"""Evaluate ONE multitask checkpoint on ONE task: seeds x n_rollouts, fresh
-init states. Writes a JSON with per-seed success rates. Meant to be launched by
-scripts/eval_queue.py (one process per (experiment, task) job), but runnable
-standalone.
+"""Evaluate ONE multitask checkpoint on ONE task: seeds x n_rollouts.
 
-    python online_evaluation_mimicgen/eval_multitask_worker.py \
+Output layout (EC-Diffuser style), rooted at --output_dir (the TASK dir):
+    <output_dir>/
+        result.json            per-seed success rates + mean/std
+        seed_<seed>/           one folder PER SEED
+            ep000_fail.mp4     first --video_episodes rollouts of that seed
+            ep001_success.mp4
+Init states: fresh env.reset() samples by default; --replay_init uses the
+packaged demo init states instead (diagnostic: separates "harness broken"
+from "policy fails off the demo distribution").
+
+    python -m online_evaluation_mimicgen.eval_multitask_worker \
         --checkpoint remote_ckpts/multitask_tok_baseline_best.pth \
         --experiment baseline --task stack_d0 \
-        --seeds 42,123,456 --n_rollouts 50 --output out.json
+        --seeds 42,123,456 --n_rollouts 50 --output_dir eval_results/baseline/stack_d0
 """
-import argparse, json, os, random
+import argparse, json, os, pickle, random
 from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -17,7 +24,7 @@ import torch
 
 from online_evaluation_mimicgen.eval_mimicgen import (
     build_env, controller_scales, load_meta, rollout,
-    DEFAULT_ENV_ROOT, DEFAULT_PACKED,
+    DEFAULT_ENV_ROOT, DEFAULT_PACKED, DEFAULT_PKL_ROOT,
 )
 from diffuser_actor import DiffuserActor
 
@@ -75,17 +82,22 @@ def main():
     p.add_argument("--seeds", default="42,123,456")
     p.add_argument("--n_rollouts", type=int, default=50)
     p.add_argument("--max_steps", type=int, default=400)
-    p.add_argument("--output", required=True)
+    p.add_argument("--output_dir", required=True,
+                   help="task-level dir: result.json + seed_*/ video folders")
     p.add_argument("--packed_root", default=DEFAULT_PACKED)
     p.add_argument("--env_root", default=DEFAULT_ENV_ROOT)
     p.add_argument("--device", default="cuda")
     p.add_argument("--save_videos", action="store_true")
     p.add_argument("--video_episodes", type=int, default=5,
-                   help="save an mp4 for the first N rollouts of the first seed")
-    p.add_argument("--video_dir", default=None)
+                   help="mp4s for the first N rollouts of EACH seed")
+    p.add_argument("--replay_init", action="store_true",
+                   help="reset to packaged demo init states (diagnostic) "
+                        "instead of fresh env.reset() samples")
     args = p.parse_args()
-    vdir = args.video_dir or str(Path(args.output).parent / "videos")
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_videos:
+        import imageio
 
     bounds = union_bounds(args.packed_root, ALL12)
     model = build_model(args.experiment, args.checkpoint, bounds, args.device)
@@ -102,38 +114,42 @@ def main():
         grid=(rows.astype(np.float64), cols.astype(np.float64)),
         workspace=np.stack([b[0] - 0.25, b[1] + 0.25]),
         pos_scale=pos_scale, rot_scale=rot_scale, control_mode="absolute",
-        fresh_reset=True,  # sample a new init from the task distribution each rollout
+        fresh_reset=not args.replay_init,
         task_id_t=torch.tensor([ALL12.index(args.task)], device=args.device),
     )
 
-    if args.save_videos:
-        import imageio
-        Path(vdir).mkdir(parents=True, exist_ok=True)
+    data = None
+    if args.replay_init:
+        with open(Path(DEFAULT_PKL_ROOT) / args.task / f"{args.task}.pkl", "rb") as f:
+            data = pickle.load(f)
 
     per_seed = []
-    for si, seed in enumerate(seeds):
+    for seed in seeds:
         random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
         try:
             env.env.seed(seed)
         except Exception:
             pass
+        seed_dir = out_dir / f"seed_{seed}"
+        if args.save_videos:
+            seed_dir.mkdir(parents=True, exist_ok=True)
         succ = 0
         for i in range(args.n_rollouts):
-            # save an mp4 for the first N rollouts of the first seed (EC-Diffuser-style)
-            want_vid = args.save_videos and si == 0 and i < args.video_episodes
-            out = rollout(model, env, None, 0, cfg, args.device,
+            # replay mode cycles the held-out episodes (last 10 of 200)
+            ep = 190 + (i % 10) if args.replay_init else 0
+            want_vid = args.save_videos and i < args.video_episodes
+            out = rollout(model, env, data, ep, cfg, args.device,
                           collect_frames=want_vid)
             if want_vid:
                 ok, frames = out
                 if frames:
                     tag = "success" if ok else "fail"
-                    imageio.mimsave(
-                        f"{vdir}/{args.experiment}__{args.task}__ep{i}_{tag}.mp4",
-                        frames, fps=20)
+                    imageio.mimsave(str(seed_dir / f"ep{i:03d}_{tag}.mp4"),
+                                    frames, fps=20)
             else:
                 ok = out
             succ += int(bool(ok))
-            if (i + 1) % 5 == 0:  # live progress so signal is visible early
+            if (i + 1) % 5 == 0:
                 print(f"[{args.experiment}/{args.task}] seed {seed}: "
                       f"{succ}/{i + 1} so far", flush=True)
         rate = succ / args.n_rollouts
@@ -146,14 +162,14 @@ def main():
     out = {
         "experiment": args.experiment, "task": args.task,
         "n_rollouts": args.n_rollouts, "seeds": seeds,
+        "init_mode": "replay" if args.replay_init else "fresh",
         "per_seed_results": per_seed,
         "mean": float(np.mean(rates)), "std": float(np.std(rates)),
     }
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "w") as f:
+    with open(out_dir / "result.json", "w") as f:
         json.dump(out, f, indent=2)
     print(f"[{args.experiment}/{args.task}] mean={out['mean']:.3f} "
-          f"std={out['std']:.3f} -> {args.output}", flush=True)
+          f"std={out['std']:.3f} -> {out_dir / 'result.json'}", flush=True)
 
 
 if __name__ == "__main__":
