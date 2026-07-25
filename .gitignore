@@ -28,3 +28,8 @@ calvin/
 
 # data directory
 data/
+
+# eval artifacts / pulled checkpoints
+remote_ckpts/
+eval_results/
+scratch_*.py

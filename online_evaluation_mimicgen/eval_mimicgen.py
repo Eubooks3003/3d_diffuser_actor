@@ -152,7 +152,11 @@ def pose_to_action(cur_pos, cur_quat_wxyz, tgt_pos, tgt_quat_wxyz,
 @torch.no_grad()
 def rollout(model, env, data, ep, cfg, device, collect_frames=False):
     env.reset()
-    env.reset_to({"states": data["init_states"][ep]})
+    if not cfg.get("fresh_reset"):
+        # replay a specific packaged init state (reproducible)
+        env.reset_to({"states": data["init_states"][ep]})
+    # else: keep the fresh env.reset() sample (a new init from the task
+    # distribution; seed the RNG before the batch for reproducibility).
     # robosuite rebuilds the sim on reset, so this must be re-fetched per episode
     sim = env.env.sim
 
@@ -188,7 +192,8 @@ def rollout(model, env, data, ep, cfg, device, collect_frames=False):
 
             traj = model(
                 None, mask.to(device), rgb_t.to(device), pcd_t.to(device),
-                None, cg.to(device), run_inference=True
+                None, cg.to(device), run_inference=True,
+                task_id=cfg.get("task_id_t"),  # multitask: index of this task
             )[0].cpu().numpy()  # (horizon, 8) pos + quat(wxyz) + openness
 
         if cfg.get("relative_action") and cfg.get("oracle") is None:
