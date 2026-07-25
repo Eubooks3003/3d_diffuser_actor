@@ -79,7 +79,12 @@ def main():
     p.add_argument("--packed_root", default=DEFAULT_PACKED)
     p.add_argument("--env_root", default=DEFAULT_ENV_ROOT)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--save_videos", action="store_true")
+    p.add_argument("--video_episodes", type=int, default=5,
+                   help="save an mp4 for the first N rollouts of the first seed")
+    p.add_argument("--video_dir", default=None)
     args = p.parse_args()
+    vdir = args.video_dir or str(Path(args.output).parent / "videos")
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
 
     bounds = union_bounds(args.packed_root, ALL12)
@@ -101,8 +106,12 @@ def main():
         task_id_t=torch.tensor([ALL12.index(args.task)], device=args.device),
     )
 
+    if args.save_videos:
+        import imageio
+        Path(vdir).mkdir(parents=True, exist_ok=True)
+
     per_seed = []
-    for seed in seeds:
+    for si, seed in enumerate(seeds):
         random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
         try:
             env.env.seed(seed)
@@ -110,8 +119,23 @@ def main():
             pass
         succ = 0
         for i in range(args.n_rollouts):
-            ok = rollout(model, env, None, 0, cfg, args.device)
+            # save an mp4 for the first N rollouts of the first seed (EC-Diffuser-style)
+            want_vid = args.save_videos and si == 0 and i < args.video_episodes
+            out = rollout(model, env, None, 0, cfg, args.device,
+                          collect_frames=want_vid)
+            if want_vid:
+                ok, frames = out
+                if frames:
+                    tag = "success" if ok else "fail"
+                    imageio.mimsave(
+                        f"{vdir}/{args.experiment}__{args.task}__ep{i}_{tag}.mp4",
+                        frames, fps=20)
+            else:
+                ok = out
             succ += int(bool(ok))
+            if (i + 1) % 5 == 0:  # live progress so signal is visible early
+                print(f"[{args.experiment}/{args.task}] seed {seed}: "
+                      f"{succ}/{i + 1} so far", flush=True)
         rate = succ / args.n_rollouts
         per_seed.append({"seed": seed, "success_rate": rate,
                          "successes": succ, "n": args.n_rollouts})

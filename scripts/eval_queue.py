@@ -33,6 +33,8 @@ def main():
     p.add_argument("--gpus", default="0")
     p.add_argument("--concurrency", type=int, default=0)  # 0 -> one per gpu
     p.add_argument("--output_dir", default="eval_results")
+    p.add_argument("--save_videos", action="store_true")
+    p.add_argument("--video_episodes", type=int, default=5)
     args = p.parse_args()
 
     exps = [e for e in args.experiments.split(",") if e.strip()]
@@ -65,6 +67,9 @@ def main():
                "--task", job["task"], "--seeds", args.seeds,
                "--n_rollouts", str(args.n_rollouts), "--max_steps", str(args.max_steps),
                "--output", job["out"], "--device", "cuda"]
+        if args.save_videos:
+            cmd += ["--save_videos", "--video_episodes", str(args.video_episodes),
+                    "--video_dir", str(out_dir / "videos")]
         log = open(out_dir / f"{job['exp']}__{job['task']}.log", "w")
         return subprocess.Popen(cmd, cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT)
 
