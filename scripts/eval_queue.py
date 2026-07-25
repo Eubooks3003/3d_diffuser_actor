@@ -61,7 +61,9 @@ def main():
         pp = os.environ.get("PYTHONPATH", "")
         pp = f"{ZOO}:{pp}" if pp else ZOO  # task-zoo registers Hammer/Kitchen envs
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu, PYTHONPATH=pp, MUJOCO_GL="egl")
-        cmd = ["xvfb-run", "-a", "python", "-u", "-m",
+        # EGL renders headless (no X display) -> no xvfb-run, which avoids the
+        # orphaned-Xvfb deadlock when workers are killed.
+        cmd = ["python", "-u", "-m",
                "online_evaluation_mimicgen.eval_multitask_worker",
                "--checkpoint", job["ckpt"], "--experiment", job["exp"],
                "--task", job["task"], "--seeds", args.seeds,
