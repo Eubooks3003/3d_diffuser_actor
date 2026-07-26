@@ -48,12 +48,42 @@ case "$EXP" in
   *) echo "unknown experiment: $EXP"; exit 1 ;;
 esac
 
-# timestamped subfolder: relaunching the same experiment never overwrites a
-# previous run — each lands in train_logs/mimicgen/<run>/<stamp>/
-STAMP=$(date +%Y%m%d_%H%M%S)
+LOGROOT="train_logs/mimicgen"
 RUN="${TAG}_tok_${EXP}"
 mkdir -p train_logs
-echo "=== $RUN/$STAMP  (action=$ACT proprio=$PROP $EXTRA)  tasks=[$TASKS]  gpu=$GPU iters=$ITERS batch=$BATCH lr=$LR workers=$WORKERS ==="
+
+# --- auto-resume (in place) ---------------------------------------------------
+# If a previous run of THIS experiment left a checkpoint, continue from it: the
+# trainer restores model+optimizer AND the step counter (start_iter = ckpt.iter)
+# and loops range(start_iter, train_iters), so --train_iters is an ABSOLUTE
+# total. Requesting 600000 after a 300k run trains only the remaining 300k.
+# Continued checkpoints advance IN PLACE (same folder as the resumed last.pth).
+# FRESH=1 forces a brand-new timestamped run from scratch.
+CKPT_ARG=""
+RESUME_CKPT=""
+if [ "${FRESH:-0}" != "1" ]; then
+  # newest last.pth across timestamped subfolders + the legacy flat folder
+  RESUME_CKPT=$(ls -t "$LOGROOT/$RUN"/*/last.pth "$LOGROOT/$RUN"/last.pth 2>/dev/null | head -n1 || true)
+fi
+
+if [ -n "$RESUME_CKPT" ]; then
+  START_ITER=$(python -c "import torch;print(torch.load('$RESUME_CKPT',map_location='cpu',weights_only=False).get('iter',0))" 2>/dev/null || echo 0)
+  if [ "$START_ITER" -ge "$ITERS" ]; then
+    echo "=== $RUN already at step $START_ITER >= $ITERS; nothing to do. (FRESH=1 to force a new run.) ==="
+    exit 0
+  fi
+  RUN_DIR=$(dirname "$RESUME_CKPT")             # continue in this folder
+  RUN_LOG_DIR="${RUN_DIR#"$LOGROOT/"}"          # run_log_dir is relative to $LOGROOT
+  CKPT_ARG="--checkpoint $RESUME_CKPT"
+  echo "=== RESUME $RUN  step $START_ITER -> $ITERS  (in place: $RUN_DIR) ==="
+else
+  STAMP=$(date +%Y%m%d_%H%M%S)                  # fresh run -> new timestamped folder
+  RUN_LOG_DIR="$RUN/$STAMP"
+  echo "=== FRESH $RUN_LOG_DIR ==="
+fi
+
+LAUNCH_STAMP=$(date +%Y%m%d_%H%M%S)
+echo "=== $RUN_LOG_DIR  (action=$ACT proprio=$PROP $EXTRA)  tasks=[$TASKS]  gpu=$GPU iters=$ITERS batch=$BATCH lr=$LR workers=$WORKERS ==="
 CUDA_VISIBLE_DEVICES=$GPU torchrun --nproc_per_node 1 --master_port $PORT \
   main_trajectory_mimicgen.py \
   --tasks $TASKS --dataset "$DATASET" \
@@ -63,6 +93,7 @@ CUDA_VISIBLE_DEVICES=$GPU torchrun --nproc_per_node 1 --master_port $PORT \
   --goal_actions 1 \
   --action_token_groups "$ACT" --proprio_token_groups "$PROP" \
   $EXTRA \
+  $CKPT_ARG \
   --rollout_freq 0 \
-  --run_log_dir "$RUN/$STAMP" \
-  2>&1 | tee "train_logs/${RUN}_${STAMP}.log"
+  --run_log_dir "$RUN_LOG_DIR" \
+  2>&1 | tee "train_logs/${RUN}_${LAUNCH_STAMP}.log"
