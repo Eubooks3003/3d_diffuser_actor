@@ -46,12 +46,18 @@ CONFIGS = {
 }
 
 
-def union_bounds(packed_root, tasks):
+def union_bounds(packed_root, tasks, goal_actions=False, osc_pos_scale=0.05):
     mn, mx = [], []
     for t in tasks:
         b = np.array(load_meta(packed_root, t)["gripper_loc_bounds"])
         mn.append(b[0]); mx.append(b[1])
-    return np.stack([np.min(mn, 0), np.max(mx, 0)])
+    bounds = np.stack([np.min(mn, 0), np.max(mx, 0)])
+    if goal_actions:
+        # MUST match training: goal-pose targets widen the bounds by one OSC
+        # step (bounds aren't stored in the ckpt, so we rebuild them here).
+        bounds[0] -= osc_pos_scale
+        bounds[1] += osc_pos_scale
+    return bounds
 
 
 def build_model(experiment, checkpoint, bounds, device):
@@ -96,6 +102,10 @@ def main():
     p.add_argument("--replay_init", action="store_true",
                    help="reset to packaged demo init states (diagnostic) "
                         "instead of fresh env.reset() samples")
+    p.add_argument("--goal_actions", type=int, default=1,
+                   help="1 if the checkpoint was trained on goal-pose targets "
+                        "(widens bounds to match training). 0 for old "
+                        "achieved-pose checkpoints.")
     args = p.parse_args()
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
@@ -109,7 +119,8 @@ def main():
         print(f"[{args.experiment}/{args.task}] auto max_steps={args.max_steps} "
               f"(2x median demo len {int(np.median(plens))})", flush=True)
 
-    bounds = union_bounds(args.packed_root, ALL12)
+    bounds = union_bounds(args.packed_root, ALL12,
+                          goal_actions=bool(args.goal_actions))
     model = build_model(args.experiment, args.checkpoint, bounds, args.device)
 
     meta = load_meta(args.packed_root, args.task)

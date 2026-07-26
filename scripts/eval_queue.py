@@ -47,6 +47,7 @@ def main():
     p.add_argument("--save_videos", action="store_true")
     p.add_argument("--video_episodes", type=int, default=5)
     p.add_argument("--replay_init", action="store_true")
+    p.add_argument("--goal_actions", type=int, default=1)  # match the ckpts' training
     args = p.parse_args()
 
     exps = [e for e in args.experiments.split(",") if e.strip()]
@@ -87,6 +88,7 @@ def main():
             cmd += ["--save_videos", "--video_episodes", str(args.video_episodes)]
         if args.replay_init:
             cmd += ["--replay_init"]
+        cmd += ["--goal_actions", str(args.goal_actions)]
         log = open(job["dir"] / "worker.log", "w")
         return subprocess.Popen(cmd, cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT)
 
