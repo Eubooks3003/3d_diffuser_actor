@@ -43,6 +43,9 @@ class MimicgenDataset(Dataset):
         val_fraction=0.05,
         workspace_margin=0.25,
         relative_action=False,
+        goal_actions=False,
+        osc_pos_scale=0.05,   # robosuite OSC_POSE output_max (verified from env hdf5s)
+        osc_rot_scale=0.5,
     ):
         self._root = Path(root)
         self._tasks = list(tasks)
@@ -51,6 +54,9 @@ class MimicgenDataset(Dataset):
         self._training = training
         self._cache_size = cache_size
         self._relative_action = relative_action
+        self._goal_actions = goal_actions
+        self._osc_pos_scale = osc_pos_scale
+        self._osc_rot_scale = osc_rot_scale
         self._cache = OrderedDict()
 
         self.task_to_id = {t: i for i, t in enumerate(self._tasks)}
@@ -92,6 +98,10 @@ class MimicgenDataset(Dataset):
         self.gripper_loc_bounds = np.stack([
             np.array(loc_min).min(0), np.array(loc_max).max(0)
         ])
+        if self._goal_actions:
+            # commanded goals can exceed achieved-pose bounds by one OSC step
+            self.gripper_loc_bounds[0] -= self._osc_pos_scale
+            self.gripper_loc_bounds[1] += self._osc_pos_scale
 
         # Raw MuJoCo depth includes the floor and skybox (points out to y=-3),
         # while the gripper spans only ~0.2m. Normalizing those by the gripper
@@ -141,11 +151,30 @@ class MimicgenDataset(Dataset):
             self._cache.popitem(last=False)
         return data
 
-    def _poses(self, data):
-        """(T, 8) pos3 + quat4 (wxyz) + openness1."""
-        pos = torch.from_numpy(data["eef_pos_replay"]).float()
-        mat = torch.from_numpy(data["eef_mat_replay"]).float().reshape(-1, 3, 3)
-        quat = matrix_to_quaternion(mat)
+    def _poses(self, data, goal=False):
+        """(T, 8) pos3 + quat4 (wxyz) + openness1.
+
+        goal=False: ACHIEVED poses (where the demo hand was) — used for the
+        proprio history, which at rollout comes from the sim's achieved state.
+        goal=True: COMMANDED goal poses implied by the demo's delta action
+        (goal = achieved (+) action * osc_scale) — the robosuite OSC target.
+        Carries the demonstrator's force intent through contact (pressing
+        'through' a surface), which achieved poses strip out; informationally
+        the same signal EC-Diffuser trains on (raw deltas), re-expressed as
+        absolute poses (Diffusion Policy's robomimic convention). Used for the
+        FUTURE TARGETS only — mixing it into proprio would train on a state
+        distribution the rollout never produces.
+        """
+        pos = data["eef_pos_replay"].astype(np.float64)
+        mat = data["eef_mat_replay"].astype(np.float64).reshape(-1, 3, 3)
+        if goal:
+            from scipy.spatial.transform import Rotation
+            act = data["action"].astype(np.float64)
+            pos = pos + act[:, :3] * self._osc_pos_scale
+            d_rot = Rotation.from_rotvec(act[:, 3:6] * self._osc_rot_scale)
+            mat = np.einsum("tij,tjk->tik", d_rot.as_matrix(), mat)
+        pos = torch.from_numpy(pos).float()
+        quat = matrix_to_quaternion(torch.from_numpy(mat).float())
         # robosuite OSC: gripper action > 0 closes, < 0 opens
         openness = (torch.from_numpy(data["action"][:, 6]).float() < 0).float()
         return torch.cat([pos, quat, openness[:, None]], dim=-1)
@@ -171,15 +200,20 @@ class MimicgenDataset(Dataset):
         task, ep_path, t = self._index[idx]
         data = self._get(ep_path)
         T = len(data["action"])
-        poses = self._poses(data)
+        # targets: goal poses (if enabled); proprio history: ALWAYS achieved
+        # poses, matching what the rollout reads from the sim.
+        tgt_poses = self._poses(data, goal=self._goal_actions)
+        hist_poses = (self._poses(data, goal=False)
+                      if self._goal_actions else tgt_poses)
 
         # future chunk, padded by repeating the final pose (the episode has
         # ended, so "hold still" is the semantically correct target)
-        fut = [poses[min(t + 1 + i, T - 1)] for i in range(self._horizon)]
+        fut = [tgt_poses[min(t + 1 + i, T - 1)] for i in range(self._horizon)]
         trajectory = torch.stack(fut)
 
         # history, padded at the start by repeating the first pose
-        hist = [poses[max(t - self._nhist + 1 + j, 0)] for j in range(self._nhist)]
+        hist = [hist_poses[max(t - self._nhist + 1 + j, 0)]
+                for j in range(self._nhist)]
         curr_gripper = torch.stack(hist)
 
         if self._relative_action:

@@ -71,6 +71,8 @@ class Arguments(tap.Tap):
     proprio_token_groups: str = "default"
     no_proprio: int = 0  # EC-Diffuser "no proprio" ablation; requires absolute actions
     diffuse_gripper: int = 0  # Option B: diffuse openness (action_dim 9->10) for a gripper token
+    goal_actions: int = 0  # targets = commanded OSC goal poses (EC-Diffuser/DP convention)
+    rollout_exclude: str = ""  # comma-separated tasks to skip in in-training rollouts
 
     # In-training rollout eval: actually runs the policy in the simulator and
     # reports task success, which loss/pos_err cannot tell you.
@@ -116,19 +118,29 @@ class TrainTester(BaseTrainTester):
             rows, cols = np.meshgrid(
                 np.arange(size), np.arange(size), indexing="ij"
             )
-            bounds = np.array(meta["gripper_loc_bounds"])
+            with open(Path(DEFAULT_PKL_ROOT) / task / f"{task}.pkl", "rb") as f:
+                self._rollout_data[task] = pickle.load(f)
+            # per-task cap: 2x median demo length (a fixed cap silently zeroes
+            # long tasks); workspace/bounds must match TRAINING (union), not
+            # this one task's bounds
+            plens = self._rollout_data[task]["path_lengths"][:200]
+            max_steps = max(self.args.rollout_max_steps,
+                            int(2 * np.median(plens)))
+            bounds = self.gripper_loc_bounds
             self._rollout_envs[task] = (env, dict(
                 cameras=meta["cameras"], size=size, nhist=self.args.num_history,
                 horizon=self.args.horizon, exe_steps=self.args.horizon // 2,
-                max_steps=self.args.rollout_max_steps,
+                max_steps=max_steps,
                 grid=(rows.astype(np.float64), cols.astype(np.float64)),
                 workspace=np.stack([bounds[0] - 0.25, bounds[1] + 0.25]),
                 pos_scale=pos_scale, rot_scale=rot_scale,
                 control_mode=self.args.rollout_control_mode,
                 relative_action=bool(self.args.relative_action),
+                # multitask: the model needs this task's id for its embedding
+                task_id_t=torch.tensor(
+                    [list(self.args.tasks).index(task)], dtype=torch.long,
+                    device="cuda" if torch.cuda.is_available() else "cpu"),
             ))
-            with open(Path(DEFAULT_PKL_ROOT) / task / f"{task}.pkl", "rb") as f:
-                self._rollout_data[task] = pickle.load(f)
         env, cfg = self._rollout_envs[task]
         return env, cfg, self._rollout_data[task]
 
@@ -141,8 +153,11 @@ class TrainTester(BaseTrainTester):
         net = model.module if hasattr(model, "module") else model
         net.eval()
 
+        excluded = {t for t in self.args.rollout_exclude.split(",") if t}
         overall = []
         for task in self.args.tasks:
+            if task in excluded:
+                continue
             env, cfg, data = self._rollout_cfg(task)
             # Must mirror MimicgenDataset's split exactly, INCLUDING
             # max_episodes_per_task -- otherwise an overfit run would roll out
@@ -202,6 +217,7 @@ class TrainTester(BaseTrainTester):
             cache_size=self.args.cache_size,
             max_episodes_per_task=self.args.max_episodes_per_task,
             relative_action=bool(self.args.relative_action),
+            goal_actions=bool(self.args.goal_actions),
         )
         test_dataset = MimicgenDataset(
             root=self.args.dataset,
@@ -212,6 +228,7 @@ class TrainTester(BaseTrainTester):
             cache_size=self.args.cache_size_val,
             max_episodes_per_task=self.args.max_episodes_per_task,
             relative_action=bool(self.args.relative_action),
+            goal_actions=bool(self.args.goal_actions),
         )
         # pos normalization must span both splits
         self.gripper_loc_bounds = train_dataset.gripper_loc_bounds

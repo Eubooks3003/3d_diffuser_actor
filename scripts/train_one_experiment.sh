@@ -48,17 +48,21 @@ case "$EXP" in
   *) echo "unknown experiment: $EXP"; exit 1 ;;
 esac
 
+# timestamped subfolder: relaunching the same experiment never overwrites a
+# previous run — each lands in train_logs/mimicgen/<run>/<stamp>/
+STAMP=$(date +%Y%m%d_%H%M%S)
 RUN="${TAG}_tok_${EXP}"
 mkdir -p train_logs
-echo "=== $RUN  (action=$ACT proprio=$PROP $EXTRA)  tasks=[$TASKS]  gpu=$GPU iters=$ITERS batch=$BATCH lr=$LR workers=$WORKERS ==="
+echo "=== $RUN/$STAMP  (action=$ACT proprio=$PROP $EXTRA)  tasks=[$TASKS]  gpu=$GPU iters=$ITERS batch=$BATCH lr=$LR workers=$WORKERS ==="
 CUDA_VISIBLE_DEVICES=$GPU torchrun --nproc_per_node 1 --master_port $PORT \
   main_trajectory_mimicgen.py \
   --tasks $TASKS --dataset "$DATASET" \
   --batch_size "$BATCH" --batch_size_val "$VAL_BATCH" --lr "$LR" \
   --train_iters "$ITERS" --val_freq 2500 --val_iters 25 --num_workers "$WORKERS" \
   --diffuse_gripper 1 \
+  --goal_actions 1 \
   --action_token_groups "$ACT" --proprio_token_groups "$PROP" \
   $EXTRA \
   --rollout_freq 0 \
-  --run_log_dir "$RUN" \
-  2>&1 | tee "train_logs/${RUN}.log"
+  --run_log_dir "$RUN/$STAMP" \
+  2>&1 | tee "train_logs/${RUN}_${STAMP}.log"

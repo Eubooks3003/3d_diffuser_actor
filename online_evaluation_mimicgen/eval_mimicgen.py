@@ -222,7 +222,8 @@ def rollout(model, env, data, ep, cfg, device, collect_frames=False):
                                camera_name=cfg["cameras"][0])[::-1].copy()
                 )
             p, q = eef_pose(sim)
-            history.append(np.concatenate([p, q, [tgt[7]]]))
+            # binarize: training proprio openness is the binary commanded state
+            history.append(np.concatenate([p, q, [float(tgt[7] > 0.5)]]))
             if env.is_success()["task"]:
                 success = True
                 break
@@ -255,6 +256,10 @@ def main():
     p.add_argument("--oracle", action="store_true",
                    help="replay ground-truth poses through the pose->action "
                         "conversion instead of the policy (harness sanity check)")
+    p.add_argument("--oracle-slowdown", type=int, default=1,
+                   help="repeat each GT pose N times: gives the OSC controller "
+                        "N sim steps to track each demo pose (tests whether "
+                        "oracle failures are controller tracking lag)")
     args = p.parse_args()
 
     device = "cuda"
@@ -310,7 +315,10 @@ def main():
     successes = []
     for i, ep in enumerate(eps):
         if args.oracle:
-            cfg["oracle"] = load_gt_poses(args.packed_root, args.task, ep)
+            gt = load_gt_poses(args.packed_root, args.task, ep)
+            if args.oracle_slowdown > 1:
+                gt = np.repeat(gt, args.oracle_slowdown, axis=0)
+            cfg["oracle"] = gt
         ok = rollout(model, env, data, ep, cfg, device)
         successes.append(ok)
         print(f"  [{i+1}/{len(eps)}] episode {ep}: {'SUCCESS' if ok else 'fail'}"
